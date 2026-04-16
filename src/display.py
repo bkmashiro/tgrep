@@ -3,13 +3,18 @@
 Produces colored output with timeline visualizations.
 """
 
+import json
+import csv
+import io
 import sys
+import time
 from datetime import timedelta
 from typing import Optional, TextIO
 
 from .parser import LogEntry
 from .query import (
     WindowResult, SequenceMatch, Correlation, TimeBucket,
+    GapResult, Session, ContextMatch,
 )
 
 
@@ -219,3 +224,177 @@ def display_entries(
         print_entry(e, highlight=pattern, out=out)
 
     out.write(f"\n{C.BOLD}Total: {len(entries)} match(es){C.RESET}\n")
+
+
+# ---------------------------------------------------------------------------
+# Gap display
+# ---------------------------------------------------------------------------
+
+def _format_duration(td: timedelta) -> str:
+    """Format a timedelta as a human-readable string."""
+    total = int(td.total_seconds())
+    if total < 60:
+        return f"{total}s"
+    minutes, seconds = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if seconds:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def display_gaps(
+    gaps: list[GapResult],
+    out: Optional[TextIO] = None,
+):
+    """Display detected time gaps."""
+    out = out or sys.stdout
+    if not gaps:
+        out.write(f"{C.DIM}No time gaps found exceeding threshold.{C.RESET}\n")
+        return
+
+    out.write(f"\n{C.BOLD}Time Gaps ({len(gaps)} found){C.RESET}\n")
+    out.write(f"{C.DIM}{'─' * 70}{C.RESET}\n")
+
+    for i, gap in enumerate(gaps):
+        ts_start = _ts_str(gap.start) if gap.start.timestamp else "??:??:??"
+        ts_end = _ts_str(gap.end) if gap.end.timestamp else "??:??:??"
+        dur = _format_duration(gap.duration)
+        out.write(
+            f"  {C.CYAN}[{ts_start}]{C.RESET} → "
+            f"{C.CYAN}[{ts_end}]{C.RESET} = "
+            f"{C.YELLOW}{C.BOLD}{dur}{C.RESET} gap "
+            f"{C.DIM}(no events){C.RESET}\n"
+        )
+
+    out.write(f"\n{C.BOLD}Largest gap: {_format_duration(gaps[0].duration)}{C.RESET}\n")
+
+
+# ---------------------------------------------------------------------------
+# Session display
+# ---------------------------------------------------------------------------
+
+def display_sessions(
+    sessions: list[Session],
+    max_entries_per_session: int = 0,
+    out: Optional[TextIO] = None,
+):
+    """Display detected sessions."""
+    out = out or sys.stdout
+    if not sessions:
+        out.write(f"{C.DIM}No sessions detected.{C.RESET}\n")
+        return
+
+    for session in sessions:
+        dur = _format_duration(session.duration) if session.duration.total_seconds() > 0 else "<1s"
+        start_str = session.start.strftime("%H:%M:%S")
+        end_str = session.end.strftime("%H:%M:%S")
+
+        out.write(
+            f"\n{C.BOLD}{C.GREEN}=== Session {session.number}: "
+            f"{start_str} – {end_str} "
+            f"({dur}, {session.count} events) ==={C.RESET}\n"
+        )
+
+        entries_to_show = session.entries
+        if max_entries_per_session > 0 and len(entries_to_show) > max_entries_per_session:
+            for e in entries_to_show[:max_entries_per_session]:
+                print_entry(e, out=out)
+            out.write(
+                f"  {C.DIM}... and {len(entries_to_show) - max_entries_per_session} more{C.RESET}\n"
+            )
+        else:
+            for e in entries_to_show:
+                print_entry(e, out=out)
+
+    total_events = sum(s.count for s in sessions)
+    out.write(
+        f"\n{C.BOLD}Total: {len(sessions)} session(s), "
+        f"{total_events} event(s){C.RESET}\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Context display
+# ---------------------------------------------------------------------------
+
+def display_context_matches(
+    results: list[ContextMatch],
+    pattern: str = "",
+    out: Optional[TextIO] = None,
+):
+    """Display context-aware search results."""
+    out = out or sys.stdout
+    if not results:
+        out.write(f"{C.DIM}No matches found.{C.RESET}\n")
+        return
+
+    for i, result in enumerate(results):
+        out.write(
+            f"\n{C.BOLD}{C.MAGENTA}━━━ Match #{i+1} "
+            f"{_line_ref(result.match)} ━━━{C.RESET}\n"
+        )
+        for e in result.before:
+            ts = f"{C.DIM}{_ts_str(e)}{C.RESET}"
+            ref = _line_ref(e)
+            out.write(f"  {ts} {ref} {C.DIM}{e.content}{C.RESET}\n")
+
+        print_entry(result.match, highlight=pattern, out=out)
+
+        for e in result.after:
+            ts = f"{C.DIM}{_ts_str(e)}{C.RESET}"
+            ref = _line_ref(e)
+            out.write(f"  {ts} {ref} {C.DIM}{e.content}{C.RESET}\n")
+
+    out.write(f"\n{C.BOLD}Total: {len(results)} match(es){C.RESET}\n")
+
+
+# ---------------------------------------------------------------------------
+# JSON / CSV output
+# ---------------------------------------------------------------------------
+
+def entries_to_json(entries: list[LogEntry]) -> str:
+    """Serialize log entries to JSON string."""
+    records = []
+    for e in entries:
+        records.append({
+            "line_number": e.line_number,
+            "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+            "content": e.content,
+            "raw": e.raw,
+        })
+    return json.dumps(records, indent=2)
+
+
+def entries_to_csv(entries: list[LogEntry]) -> str:
+    """Serialize log entries to CSV string."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["line_number", "timestamp", "content"])
+    for e in entries:
+        writer.writerow([
+            e.line_number,
+            e.timestamp.isoformat() if e.timestamp else "",
+            e.content,
+        ])
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+
+def display_summary(
+    match_count: int,
+    elapsed_seconds: float,
+    out: Optional[TextIO] = None,
+):
+    """Display a summary line."""
+    out = out or sys.stderr
+    out.write(
+        f"{C.DIM}Found {match_count} matches in {elapsed_seconds:.2f}s{C.RESET}\n"
+    )
