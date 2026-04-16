@@ -4,6 +4,9 @@ Supports:
 - Time-windowed searches (before/after an event within a duration)
 - Event sequence matching (A then B then C within N seconds)
 - Temporal correlation detection (what co-occurs with a pattern?)
+- Gap detection (find time gaps with no events)
+- Session detection (group events by idle gaps)
+- Context search (N events before/after each match)
 """
 
 import re
@@ -305,3 +308,163 @@ def frequency_analysis(
         current = bucket_end
 
     return buckets
+
+
+# ---------------------------------------------------------------------------
+# Gap detection: find time gaps with no events
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GapResult:
+    """A detected time gap (period with no events)."""
+    start: LogEntry          # last event before the gap
+    end: LogEntry            # first event after the gap
+    duration: timedelta      # length of the gap
+
+
+def find_gaps(
+    entries: list[LogEntry],
+    min_gap: timedelta,
+) -> list[GapResult]:
+    """Find time gaps larger than min_gap between consecutive events.
+
+    Args:
+        entries: Parsed log entries (must be sorted by timestamp).
+        min_gap: Minimum gap duration to report.
+
+    Returns:
+        List of GapResult objects sorted by gap duration descending.
+    """
+    timed = [e for e in entries if e.has_timestamp]
+    gaps: list[GapResult] = []
+
+    for i in range(len(timed) - 1):
+        assert timed[i].timestamp is not None
+        assert timed[i + 1].timestamp is not None
+        delta = timed[i + 1].timestamp - timed[i].timestamp
+        if delta >= min_gap:
+            gaps.append(GapResult(
+                start=timed[i],
+                end=timed[i + 1],
+                duration=delta,
+            ))
+
+    gaps.sort(key=lambda g: g.duration, reverse=True)
+    return gaps
+
+
+# ---------------------------------------------------------------------------
+# Session detection: group events by idle gaps
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Session:
+    """A group of events separated by idle gaps."""
+    number: int
+    entries: list[LogEntry]
+    start: datetime
+    end: datetime
+    duration: timedelta
+
+    @property
+    def count(self) -> int:
+        return len(self.entries)
+
+
+def detect_sessions(
+    entries: list[LogEntry],
+    idle_threshold: timedelta = timedelta(minutes=30),
+) -> list[Session]:
+    """Detect sessions by grouping events separated by idle gaps.
+
+    Args:
+        entries: Parsed log entries.
+        idle_threshold: Minimum idle gap to start a new session.
+
+    Returns:
+        List of Session objects.
+    """
+    timed = [e for e in entries if e.has_timestamp]
+    if not timed:
+        return []
+
+    sessions: list[Session] = []
+    current_session: list[LogEntry] = [timed[0]]
+
+    for i in range(1, len(timed)):
+        assert timed[i].timestamp is not None
+        assert timed[i - 1].timestamp is not None
+        delta = timed[i].timestamp - timed[i - 1].timestamp
+        if delta >= idle_threshold:
+            # Close current session
+            start_ts = current_session[0].timestamp
+            end_ts = current_session[-1].timestamp
+            assert start_ts is not None and end_ts is not None
+            sessions.append(Session(
+                number=len(sessions) + 1,
+                entries=current_session,
+                start=start_ts,
+                end=end_ts,
+                duration=end_ts - start_ts,
+            ))
+            current_session = [timed[i]]
+        else:
+            current_session.append(timed[i])
+
+    # Close final session
+    if current_session:
+        start_ts = current_session[0].timestamp
+        end_ts = current_session[-1].timestamp
+        assert start_ts is not None and end_ts is not None
+        sessions.append(Session(
+            number=len(sessions) + 1,
+            entries=current_session,
+            start=start_ts,
+            end=end_ts,
+            duration=end_ts - start_ts,
+        ))
+
+    return sessions
+
+
+# ---------------------------------------------------------------------------
+# Context search: show N events before/after each match
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ContextMatch:
+    """A match with surrounding context events."""
+    match: LogEntry
+    before: list[LogEntry]
+    after: list[LogEntry]
+
+
+def search_with_context(
+    entries: list[LogEntry],
+    pattern: str,
+    context_count: int = 3,
+) -> list[ContextMatch]:
+    """Search for a pattern and return N events before and after each match.
+
+    Args:
+        entries: Parsed log entries.
+        pattern: Regex pattern to search for.
+        context_count: Number of events to show before and after each match.
+
+    Returns:
+        List of ContextMatch objects.
+    """
+    pat = re.compile(pattern, re.IGNORECASE)
+    results: list[ContextMatch] = []
+
+    for i, entry in enumerate(entries):
+        if pat.search(entry.content):
+            before = entries[max(0, i - context_count):i]
+            after = entries[i + 1:i + 1 + context_count]
+            results.append(ContextMatch(
+                match=entry,
+                before=before,
+                after=after,
+            ))
+
+    return results

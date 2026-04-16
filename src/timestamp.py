@@ -38,6 +38,12 @@ TIMESTAMP_FORMATS = [
         None,
         "iso8601_z",
     ),
+    # Python logging default: 2024-01-15 14:23:01,123
+    (
+        re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2},\d+)"),
+        None,
+        "python_log",
+    ),
     # ISO 8601 with fractional seconds (no tz)
     (
         re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\.\d+)"),
@@ -49,6 +55,12 @@ TIMESTAMP_FORMATS = [
         re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})"),
         "%Y-%m-%dT%H:%M:%S",
         "iso8601",
+    ),
+    # Nginx / Go standard: YYYY/MM/DD HH:MM:SS
+    (
+        re.compile(r"(?P<ts>\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})"),
+        "%Y/%m/%d %H:%M:%S",
+        "nginx",
     ),
     # Syslog: Mon DD HH:MM:SS (no year)
     (
@@ -66,17 +78,17 @@ TIMESTAMP_FORMATS = [
         "%d/%b/%Y:%H:%M:%S %z",
         "apache",
     ),
+    # Unix epoch millis (13 digits) — must come before epoch seconds
+    (
+        re.compile(r"(?<!\d)(?P<ts>1\d{12})(?!\d)"),
+        None,
+        "epoch_ms",
+    ),
     # Unix epoch seconds (10 digits) with optional fractional part
     (
         re.compile(r"(?<!\d)(?P<ts>1\d{9}(?:\.\d+)?)(?!\d)"),
         None,
         "epoch",
-    ),
-    # Unix epoch millis (13 digits)
-    (
-        re.compile(r"(?<!\d)(?P<ts>1\d{12})(?!\d)"),
-        None,
-        "epoch_ms",
     ),
     # MM/DD/YYYY HH:MM:SS
     (
@@ -187,6 +199,8 @@ def parse_timestamp(text: str, format_name: str) -> Optional[datetime]:
 
         if name.startswith("iso8601"):
             return _parse_iso_flexible(ts_str)
+        elif name == "python_log":
+            return _parse_python_log(ts_str)
         elif name == "syslog":
             return _parse_syslog(ts_str)
         elif name == "epoch":
@@ -205,6 +219,20 @@ def parse_timestamp(text: str, format_name: str) -> Optional[datetime]:
             except ValueError:
                 return None
     return None
+
+
+def _parse_python_log(text: str) -> Optional[datetime]:
+    """Parse Python logging format: 2024-01-15 14:23:01,123"""
+    text = text.replace("T", " ")
+    try:
+        base, frac_str = text.rsplit(",", 1)
+        frac = float("0." + frac_str)
+        dt = datetime.strptime(base.strip(), "%Y-%m-%d %H:%M:%S")
+        from datetime import timedelta
+        dt = dt + timedelta(seconds=frac)
+        return dt
+    except (ValueError, IndexError):
+        return None
 
 
 def extract_timestamp(line: str, format_name: str) -> tuple[Optional[datetime], Optional[str]]:
